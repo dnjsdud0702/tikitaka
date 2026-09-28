@@ -19,6 +19,7 @@ import com.tikitaka.ticketing.global.exception.BusinessException;
 import com.tikitaka.ticketing.reservation.infrastructure.kafka.KafkaTopics;
 import com.tikitaka.ticketing.reservation.infrastructure.kafka.event.PaymentFailedEvent;
 import com.tikitaka.ticketing.reservation.infrastructure.kafka.event.PaymentSucceededEvent;
+import com.tikitaka.ticketing.reservation.domain.port.ReservationQueueFlowPort;
 import com.tikitaka.ticketing.testsupport.PostgresIntegrationTest;
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.admin.AdminClientConfig;
@@ -39,6 +40,7 @@ import org.springframework.kafka.support.KafkaHeaders;
 import org.springframework.kafka.support.SendResult;
 import org.springframework.kafka.test.context.EmbeddedKafka;
 import org.springframework.test.context.TestPropertySource;
+import org.springframework.test.context.bean.override.mockito.MockitoBean;
 
 @PostgresIntegrationTest
 @EmbeddedKafka(
@@ -68,6 +70,9 @@ class PaymentEventConsumerKafkaIntegrationTest {
 
     @Autowired
     private ObjectMapper objectMapper;
+
+    @MockitoBean
+    private ReservationQueueFlowPort reservationQueueFlowPort;
 
     @Value("${spring.kafka.bootstrap-servers}")
     private String bootstrapServers;
@@ -113,6 +118,48 @@ class PaymentEventConsumerKafkaIntegrationTest {
         assertThat(queryString("SELECT seat_status FROM p_schedule_seat WHERE schedule_seat_id = ?", fixture.scheduleSeatId()))
                 .isEqualTo("SOLD");
         assertSingleInboxAndOutbox(eventId, fixture.reservationId(), "PAYMENT_SUCCEEDED", "RESERVATION_CONFIRMED");
+        assertThat(topicEndOffset(KafkaTopics.PAYMENT_EVENTS_DLT)).isEqualTo(dltOffsetBefore);
+    }
+
+    @Test
+    void 만료_시각이_지난_RESERVED_선점도_결제_성공_이벤트를_소비하면_확정된다() throws Exception {
+        Fixture fixture = insertPaymentProcessingFixture(true);
+        UUID eventId = UUID.randomUUID();
+        OffsetDateTime occurredAt = OffsetDateTime.now(ZoneOffset.UTC);
+        long dltOffsetBefore = topicEndOffset(KafkaTopics.PAYMENT_EVENTS_DLT);
+        String payload = serialize(new PaymentSucceededEvent(
+                eventId,
+                "PAYMENT_SUCCEEDED",
+                occurredAt,
+                fixture.reservationId(),
+                1,
+                fixture.paymentId(),
+                fixture.reservationId(),
+                USER_ID,
+                AMOUNT,
+                occurredAt
+        ));
+
+        kafkaTemplate.send(KafkaTopics.PAYMENT_EVENTS, fixture.reservationId().toString(), payload)
+                .get(10, TimeUnit.SECONDS);
+
+        await()
+                .atMost(Duration.ofSeconds(15))
+                .pollInterval(Duration.ofMillis(100))
+                .untilAsserted(() -> {
+                    assertThat(queryString(
+                            "SELECT reservation_status FROM p_reservation WHERE reservation_id = ?",
+                            fixture.reservationId())).isEqualTo("CONFIRMED");
+                    assertThat(queryString(
+                            "SELECT hold_status FROM p_seat_hold WHERE seat_hold_id = ?",
+                            fixture.seatHoldId())).isEqualTo("CONFIRMED");
+                    assertThat(queryString(
+                            "SELECT seat_status FROM p_schedule_seat WHERE schedule_seat_id = ?",
+                            fixture.scheduleSeatId())).isEqualTo("SOLD");
+                });
+
+        assertSingleInboxAndOutbox(
+                eventId, fixture.reservationId(), "PAYMENT_SUCCEEDED", "RESERVATION_CONFIRMED");
         assertThat(topicEndOffset(KafkaTopics.PAYMENT_EVENTS_DLT)).isEqualTo(dltOffsetBefore);
     }
 
@@ -193,6 +240,10 @@ class PaymentEventConsumerKafkaIntegrationTest {
     }
 
     private Fixture insertPaymentProcessingFixture() {
+        return insertPaymentProcessingFixture(false);
+    }
+
+    private Fixture insertPaymentProcessingFixture(boolean expired) {
         UUID reservationId = UUID.randomUUID();
         UUID paymentId = UUID.randomUUID();
         UUID eventId = UUID.randomUUID();
@@ -217,9 +268,12 @@ class PaymentEventConsumerKafkaIntegrationTest {
                     hold_status, held_at, expires_at,
                     created_at, created_by, updated_at, updated_by,
                     idempotency_key, reserved_at
-                ) VALUES (?, ?, ?, ?, 'RESERVED', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP + INTERVAL '1 hour',
+                ) VALUES (?, ?, ?, ?, 'RESERVED', CURRENT_TIMESTAMP - INTERVAL '11 minutes',
+                          CASE WHEN ? THEN CURRENT_TIMESTAMP - INTERVAL '1 minute'
+                               ELSE CURRENT_TIMESTAMP + INTERVAL '1 hour' END,
                           CURRENT_TIMESTAMP, ?, CURRENT_TIMESTAMP, ?, ?, CURRENT_TIMESTAMP)
-                """, seatHoldId, scheduleSeatId, USER_ID, holdToken, USER_ID, USER_ID, "integration-hold-" + seatHoldId);
+                """, seatHoldId, scheduleSeatId, USER_ID, holdToken, expired,
+                USER_ID, USER_ID, "integration-hold-" + seatHoldId);
 
         jdbcTemplate.update("""
                 INSERT INTO p_reservation (

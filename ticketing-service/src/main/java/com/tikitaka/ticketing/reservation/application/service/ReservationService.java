@@ -1,4 +1,4 @@
-package com.tikitaka.ticketing.reservation.application;
+package com.tikitaka.ticketing.reservation.application.service;
 
 import com.tikitaka.ticketing.global.exception.BusinessException;
 import com.tikitaka.ticketing.global.exception.CommonErrorCode;
@@ -17,6 +17,7 @@ import com.tikitaka.ticketing.reservation.domain.model.PaymentCreationInfo;
 import com.tikitaka.ticketing.reservation.domain.model.ReservationSeatInfo;
 import com.tikitaka.ticketing.reservation.domain.model.SeatHoldValidationInfo;
 import com.tikitaka.ticketing.reservation.domain.port.PaymentCreationPort;
+import com.tikitaka.ticketing.reservation.domain.port.ReservationQueueFlowPort;
 import com.tikitaka.ticketing.reservation.domain.port.ReservationRepositoryPort;
 import com.tikitaka.ticketing.reservation.domain.port.SeatHoldQueryPort;
 import com.tikitaka.ticketing.reservation.exception.ReservationErrorCode;
@@ -27,8 +28,9 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import java.time.Instant;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
@@ -37,6 +39,7 @@ import java.util.stream.Collectors;
 
 @Service
 public class ReservationService {
+    private static final Logger log = LoggerFactory.getLogger(ReservationService.class);
     private static final String USER_ROLE = "USER";
     private static final String ADMIN_ROLE = "ADMIN";
     private static final int DEFAULT_PAGE = 0;
@@ -46,16 +49,19 @@ public class ReservationService {
     private final ReservationRepositoryPort reservationRepositoryPort;
     private final SeatHoldQueryPort seatHoldQueryPort;
     private final PaymentCreationPort paymentCreationPort;
+    private final ReservationQueueFlowPort reservationQueueFlowPort;
     private final ReservationCreationTransactionService reservationCreationTransactionService;
 
     public ReservationService(ReservationRepositoryPort reservationRepositoryPort,
             SeatHoldQueryPort seatHoldQueryPort, PaymentCreationPort paymentCreationPort,
-            ReservationCreationTransactionService reservationCreationTransactionService) {
+            ReservationCreationTransactionService reservationCreationTransactionService,
+            ReservationQueueFlowPort reservationQueueFlowPort) {
 
         this.reservationRepositoryPort = reservationRepositoryPort;
         this.seatHoldQueryPort = seatHoldQueryPort;
         this.paymentCreationPort = paymentCreationPort;
         this.reservationCreationTransactionService = reservationCreationTransactionService;
+        this.reservationQueueFlowPort = reservationQueueFlowPort;
     }
 
     @Transactional(readOnly = true)
@@ -116,6 +122,18 @@ public class ReservationService {
         ReservationCreationPreparation preparation = reservationCreationTransactionService.prepareReservation(command);
         if (!preparation.paymentCreationRequired()) {
             return preparation.reservationResult();
+        }
+
+        // Queue 연결은 예매 후 정리를 위한 부가 작업으로, 실패해도 결제 생성을 계속함
+        try {
+            reservationQueueFlowPort.bindReservationFlow(
+                    preparation.eventSessionId(), preparation.userId(), preparation.reservationId()
+            );
+        } catch (RuntimeException exception) {
+            String errorCode = exception instanceof BusinessException businessException
+                    ? businessException.getErrorCode().getCode() : exception.getClass().getSimpleName();
+            log.warn("Queue 예매 연결 실패: eventSessionId={}, userId={}, reservationId={}, errorCode={}",
+                    preparation.eventSessionId(), preparation.userId(), preparation.reservationId(), errorCode, exception);
         }
 
         // DB 트랜잭션 밖에서 Payment를 호출해 외부 응답 지연이 예매 의도를 롤백하지 않도록 분리

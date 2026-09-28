@@ -1,4 +1,4 @@
-package com.tikitaka.ticketing.reservation.application;
+package com.tikitaka.ticketing.reservation.application.service;
 
 import com.tikitaka.ticketing.global.exception.BusinessException;
 import com.tikitaka.ticketing.global.exception.CommonErrorCode;
@@ -113,8 +113,8 @@ public class ReservationCreationTransactionService {
 
     private ReservationCreationPreparation toPreparation(Reservation reservation, boolean created) {
         return new ReservationCreationPreparation(
-                reservation.getReservationId(), reservation.getUserId(), reservation.getTotalAmount(),
-                reservation.getIdempotencyKey(), created,
+                reservation.getReservationId(), reservation.getEventSessionId(), reservation.getUserId(),
+                reservation.getTotalAmount(), reservation.getIdempotencyKey(), created,
                 reservation.getReservationStatus() == ReservationStatus.PAYMENT_PENDING,
                 new CreateReservationResult(reservation, created)
         );
