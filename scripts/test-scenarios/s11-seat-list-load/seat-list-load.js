@@ -6,7 +6,7 @@
 // (python/pip/venv 불필요 - k6 하나만 있으면 됩니다)
 import http from 'k6/http';
 import { check, sleep } from 'k6';
-import { Trend, Counter } from 'k6/metrics';
+import { Trend, Counter, Rate } from 'k6/metrics';
 
 // ================= 환경 변수 =================
 const BASE_URL = __ENV.BASE_URL || 'http://localhost:8082';
@@ -18,7 +18,7 @@ const FILTER_QUERY = __ENV.FILTER_QUERY || 'section=VIP';
 // PAGE_SIZE를 0 이하로 주면 이전처럼 페이지네이션 파라미터를 안 붙여서 API 기본 size(50)로 조회.
 const PAGE_SIZE = Number(__ENV.PAGE_SIZE || 50);
 const PAGE_NUMBER = Number(__ENV.PAGE_NUMBER || 0);
-const SCENARIO = __ENV.SCENARIO || 'smoke'; // smoke | compare | load
+const SCENARIO = __ENV.SCENARIO || 'smoke'; // smoke | compare | load | view
 const REQUEST_TIMEOUT = __ENV.REQUEST_TIMEOUT || '5s';
 
 // load 시나리오 전용: 이번 실행에서 고정할 VU 수 1개 (단계별로 wrapper 스크립트가 반복 호출)
@@ -28,6 +28,19 @@ const LOAD_VUS = Number(__ENV.LOAD_VUS || 50);
 // TTL을 넘겨 후반부 요청이 Q-001로 대량 실패했음).
 const LOAD_RAMP = __ENV.LOAD_RAMP || '20s';
 const LOAD_DURATION = __ENV.LOAD_DURATION || '1m';
+
+// view 시나리오 전용 (도착률 기반 open model).
+// 측정 단위를 "요청 1건"이 아니라 "한 사용자가 좌석맵 한 화면을 보는 데 필요한 요청 전체"로 고정합니다.
+// - VU 수가 아니라 초당 조회 시작 수(VIEW_RATE)를 고정하므로, 서버가 느려져도 걸리는 부하가 줄지 않습니다
+//   (closed model인 load 시나리오는 응답이 느려지면 요청 수도 같이 줄어 포화 구간이 실제보다 좋게 보임).
+// - 페이지 크기나 API 구조가 바뀌어도 "좌석맵 1회 조회"라는 같은 일을 기준으로 전후를 비교할 수 있습니다.
+const VIEW_RATE = Number(__ENV.VIEW_RATE || 10); // 초당 좌석맵 조회 시작 수
+const VIEW_DURATION = __ENV.VIEW_DURATION || '2m';
+const VIEW_PAGE_SIZE = Number(__ENV.VIEW_PAGE_SIZE || 200); // API 최대 size - 가장 적은 요청 수로 전체를 받는 경우
+const VIEW_MAX_VUS = Number(__ENV.VIEW_MAX_VUS || 300);
+// 시드한 좌석 수. 지정하면 한 번의 조회에서 받은 좌석 수가 이 값과 같은지 검증합니다(워크로드 동일성 확인).
+const EXPECTED_SEATS = Number(__ENV.EXPECTED_SEATS || 0);
+const VIEW_MAX_PAGES = 500; // hasNext가 잘못 내려와도 무한 반복하지 않도록 하는 안전장치
 
 // ================= 토큰 발급(mint) 관련 환경 변수 =================
 // 재실행 시 userId가 겹치면 이미 ENTERED 상태라 재발급이 막힐 수 있어, 매 실행마다 Date.now() 기반으로
@@ -41,6 +54,7 @@ const TOKENS_FILE = __ENV.TOKENS_FILE || '';
 function requiredUserCount() {
     if (SCENARIO === 'smoke') return 1;
     if (SCENARIO === 'compare') return Number(__ENV.COMPARE_VUS || 10);
+    if (SCENARIO === 'view') return VIEW_MAX_VUS;
     return LOAD_VUS;
 }
 const REQUIRED_USERS = requiredUserCount();
@@ -53,6 +67,12 @@ const MINT_TIMEOUT_S = Number(
 const responseSize = new Trend('seat_response_size', false);
 const businessSuccess = new Counter('business_success');
 const timeoutCount = new Counter('timeout_count');
+// view 시나리오: 좌석맵 1회 조회 단위 지표
+const viewDuration = new Trend('seat_map_view_duration', true); // 성공한 조회의 전체 소요시간
+const viewFailed = new Rate('seat_map_view_failed');
+const viewRequests = new Trend('seat_map_view_requests', false); // 조회 1회에 든 요청 수
+const viewBytes = new Trend('seat_map_view_bytes', false); // 조회 1회에 받은 총 바이트
+const viewSeats = new Trend('seat_map_view_seats', false); // 조회 1회에 받은 좌석 수
 
 // ================= 시나리오 정의 =================
 const scenarioDefs = {
@@ -76,16 +96,40 @@ const scenarioDefs = {
             { duration: LOAD_RAMP, target: 0 },
         ],
     },
+    view: {
+        executor: 'constant-arrival-rate',
+        rate: VIEW_RATE,
+        timeUnit: '1s',
+        duration: VIEW_DURATION,
+        // 종료 시점이 밀리면 서버 지표 수집 구간과 어긋나므로, 끝난 뒤 남은 조회는 짧게만 기다립니다.
+        gracefulStop: '5s',
+        // 실행 중 VU 생성 비용이 측정에 섞이지 않도록 전부 미리 만들어둡니다.
+        // VU가 모자라 시작하지 못한 조회는 dropped_iterations로 집계됩니다(= 서버 포화 신호).
+        preAllocatedVUs: VIEW_MAX_VUS,
+        maxVUs: VIEW_MAX_VUS,
+        exec: 'seatMapView',
+    },
 };
+
+// 요청 단위 SLA(p95<500ms)는 기존 시나리오용, view는 조회 단위 SLA로 판정합니다.
+const thresholds = SCENARIO === 'view'
+    ? {
+        seat_map_view_duration: ['p(95)<1000'],
+        seat_map_view_failed: ['rate<0.01'],
+        dropped_iterations: ['count==0'],
+        // 판정용이 아니라 요약에 좌석 조회 요청만의 분포를 따로 출력하기 위한 항목입니다.
+        'http_req_duration{name:seat_list}': ['p(95)>=0'],
+    }
+    : {
+        http_req_duration: ['p(95)<500'],
+        http_req_failed: ['rate<0.01'],
+    };
 
 export const options = {
     scenarios: { [SCENARIO]: scenarioDefs[SCENARIO] },
     // 토큰 발급(setup)이 끝날 때까지 k6가 기다려주는 최대 시간. mint 로직 자체 타임아웃보다 여유 있게 잡음.
     setupTimeout: `${MINT_TIMEOUT_S + 30}s`,
-    thresholds: {
-        http_req_duration: ['p(95)<500'],
-        http_req_failed: ['rate<0.01'],
-    },
+    thresholds,
     summaryTrendStats: ['avg', 'min', 'med', 'max', 'p(50)', 'p(95)', 'p(99)'],
 };
 
@@ -210,5 +254,66 @@ export default function (data) {
         console.log(
             `status=${res.status}, duration=${res.timings.duration}ms, size=${res.body ? res.body.length : 0}bytes`
         );
+    }
+}
+
+// ================= view 시나리오: 좌석맵 1회 조회 =================
+// 현재 API(page/size)로 회차의 전체 좌석을 받으려면 hasNext가 false가 될 때까지 순서대로 요청해야 합니다.
+// API 구조를 바꾸면(예: 배치도/상태 분리) 이 함수만 교체해서 같은 지표로 비교합니다.
+export function seatMapView(data) {
+    const tokenPool = data.tokenPool;
+    const identity = tokenPool[(__VU - 1) % tokenPool.length];
+    const params = {
+        headers: {
+            'X-User-Id': identity.userId,
+            'X-Queue-Token': identity.token,
+        },
+        // setup()의 토큰 발급 요청과 섞이지 않도록 좌석 조회 요청만 따로 집계합니다.
+        tags: { name: 'seat_list' },
+        timeout: REQUEST_TIMEOUT,
+    };
+
+    const startedAt = Date.now();
+    let requests = 0;
+    let bytes = 0;
+    let seats = 0;
+    let ok = true;
+
+    for (let page = 0; page < VIEW_MAX_PAGES; page++) {
+        const res = http.get(
+            `${BASE_URL}/api/v1/schedules/${SESSION_ID}/seats?page=${page}&size=${VIEW_PAGE_SIZE}`,
+            params
+        );
+        requests++;
+        bytes += res.body ? res.body.length : 0;
+
+        if (res.status === 0) {
+            timeoutCount.add(1);
+        }
+        if (res.status !== 200) {
+            ok = false;
+            break;
+        }
+
+        const body = res.json();
+        seats += body.data.length;
+        if (!body.meta.hasNext) {
+            break;
+        }
+    }
+
+    if (ok && EXPECTED_SEATS > 0 && seats !== EXPECTED_SEATS) {
+        ok = false;
+    }
+
+    check(ok, { 'seat map view complete': (v) => v });
+    viewFailed.add(!ok);
+    viewRequests.add(requests);
+    viewBytes.add(bytes);
+    viewSeats.add(seats);
+    if (ok) {
+        // 실패한 조회는 중간에 끊겨 짧게 끝나므로 소요시간 분포에 넣지 않습니다.
+        viewDuration.add(Date.now() - startedAt);
+        businessSuccess.add(1);
     }
 }

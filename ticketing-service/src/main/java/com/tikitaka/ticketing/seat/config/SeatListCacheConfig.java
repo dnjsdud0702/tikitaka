@@ -43,6 +43,8 @@ public class SeatListCacheConfig {
                 Caffeine.newBuilder()
                         .expireAfterWrite(cacheTtlSeconds, TimeUnit.SECONDS)
                         .maximumSize(10_000)
+                        // 적중률(cache_gets_total{result=hit|miss})을 Prometheus로 내보내기 위해 통계를 켠다.
+                        .recordStats()
         );
         return cacheManager;
     }

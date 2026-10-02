@@ -1,168 +1,134 @@
-# S11-B 인기 회차 좌석 목록 반복조회 부하테스트 (Seat List Load)
+# S11-B 인기 회차 좌석맵 조회 부하테스트 (Seat List Load)
 
 대량 데이터 상황에서 인기 회차의 좌석 목록(`GET /api/v1/schedules/{eventSessionId}/seats`)을
-여러 사용자가 반복 조회할 때 응답시간·오류율·응답 크기가 어떻게 변하는지 확인하는 부하테스트입니다.
+여러 사용자가 조회할 때 어디까지 버티고, 지연이 어느 구간에서 생기는지 확인하는 부하테스트입니다.
 
 - 주 담당: Seat / 협업: Queue·Infra
-- 도구: k6, SQL, Grafana
+- 도구: k6, jq, Docker, Prometheus·Grafana
+
+## 측정 기준
+
+| 항목 | 기준 | 이유 |
+|---|---|---|
+| 측정 단위 | **좌석맵 1회 조회** = 회차의 전체 좌석을 받는 데 필요한 요청 전체 (`size=200`으로 `hasNext`가 false가 될 때까지) | 요청 1건 기준으로는 페이지 크기만 줄여도 응답 크기·응답시간이 좋아 보입니다. 사용자가 하는 일(좌석맵 한 화면 보기)을 단위로 잡아야 페이지 크기나 API 구조가 바뀌어도 전후 비교가 됩니다. |
+| 부하 모델 | **초당 조회 시작 수 고정** (k6 `constant-arrival-rate`) | VU 수를 고정하면 서버가 느려질수록 요청 수도 같이 줄어 포화 구간이 실제보다 좋게 나옵니다. 도착률을 고정하면 처리하지 못한 조회가 `dropped_iterations`로 드러납니다. |
+| 판정 | 조회 p95 < 1,000ms, 조회 실패율 < 1%, 못 시작한 조회 0건 | 요청 단위가 아니라 조회 단위 SLA로 판정합니다. |
+| 서버 지표 | 단계마다 같은 시간 구간의 Prometheus 값을 JSON으로 저장 | k6는 클라이언트가 본 시간만 알려주므로, 원인은 서버 지표로 교차검증합니다. |
+| 실행 조건 기록 | 커밋·이미지·캐시/풀/TTL 설정·좌석 수를 `run-meta.txt`에 저장 | 재빌드 누락이나 설정 차이로 결과가 달라진 경우를 구분하기 위함입니다. |
+
+> 2026-09-15~17 결과(`docs/test-results/S11-seat-list-load/`)는 요청 1건 기준 + VU 고정 방식으로
+> 측정한 값이라, 이 방식으로 측정한 결과와 직접 비교할 수 없습니다.
 
 ## Quickstart
 
-**현재 코드 상태: `SeatListReader.PROJECTION_ENABLED = true`, `SeatListCacheConfig.CACHE_ENABLED = true`
-(TTL 2초)** — 필드 프로젝션 + 짧은 TTL 캐시가 둘 다 켜져 있습니다. 아래 명령어를 위에서부터
-순서대로 그대로 실행하면 지금과 똑같은 조건으로 테스트를 재현할 수 있습니다. (다른 실험 조합을
-보고 싶다면 아래 "성능 개선 실험" 절에서 상수를 바꾸는 방법을 참고하세요.)
-
 ```bash
-# 0) (최초 1회) k6 설치 — 이미 있으면 건너뛰기
-brew install k6
-# 또는 docker run --rm -i grafana/k6 run - <script.js 형태로 매번 실행해도 됩니다.
+# 1) 스택 기동 - test 파일을 함께 적용해야 Histogram·Tomcat 지표와 환경변수 오버라이드가 켜집니다
+docker compose -f docker-compose.yml -f docker-compose.test.yml up -d --build \
+  ticketing-service platform-service prometheus grafana
 
-# 1) 스택 기동 + 지금 코드(위 두 토글이 true인 상태)로 이미지 재빌드
-docker-compose up -d --build
-
-# 2) ticketing-service가 healthy 될 때까지 대기 (STATUS가 healthy로 바뀔 때까지 몇 번 반복 확인)
-docker-compose ps ticketing-service
-
-# 3) 인기 회차(31000000-0000-0000-0000-000000000001)에 대량 더미 좌석 시드
-psql "host=localhost port=5434 dbname=tikitaka_ticketing user=ticketing" \
+# 2) (최초 1회) 플랫폼·티켓팅 기본 시드 + 대량 더미 좌석 시드
+#    기본 시드는 scripts/test-scenarios/s01-happy-path/seed/ 참고
+docker exec -i tikitaka-ticketing-postgres psql -U ticketing -d tikitaka_ticketing \
   -v session_id="'31000000-0000-0000-0000-000000000001'" \
-  -v seat_count=3000 \
-  -v available_ratio=0.05 \
-  -v held_ratio=0.05 \
-  -f scripts/test-scenarios/s11-seat-list-load/seed-seat-list-load.sql
+  -v seat_count=3000 -v available_ratio=0.05 -v held_ratio=0.05 \
+  < scripts/test-scenarios/s11-seat-list-load/seed-seat-list-load.sql
 
-# 4) (최초 1회) 실행 스크립트에 실행 권한 부여 — git에서 실행 비트가 안 딸려올 수 있습니다
-chmod +x scripts/test-scenarios/s11-seat-list-load/run-seat-list-load-steps.sh
+# 3) 단계별 실행 (워밍업 1분 → 초당 10 → 20 → 30 → 50 → 100회 조회, 단계별 2분)
+scripts/test-scenarios/s11-seat-list-load/run-seat-list-load-steps.sh
 
-# 5) k6 로드 테스트 실행 (20 VU 워밍업 → 50 → 100 → 300 → 500 → 1,000 VU), 콘솔 로그도 같이 저장
-mkdir -p artifacts/k6/s11-seat-list-load/logs
-BASE_URL=http://localhost:8082 scripts/test-scenarios/s11-seat-list-load/run-seat-list-load-steps.sh \
-  2>&1 | tee artifacts/k6/s11-seat-list-load/logs/run_$(date +%H%M%S).log
-
-# 6) (테스트가 끝난 뒤) 시드로 만든 더미 좌석 정리
-psql "host=localhost port=5434 dbname=tikitaka_ticketing user=ticketing" \
+# 4) (테스트가 끝난 뒤) 더미 좌석 정리
+docker exec -i tikitaka-ticketing-postgres psql -U ticketing -d tikitaka_ticketing \
   -v session_id="'31000000-0000-0000-0000-000000000001'" \
-  -f scripts/test-scenarios/s11-seat-list-load/cleanup-seat-list-load.sql
+  < scripts/test-scenarios/s11-seat-list-load/cleanup-seat-list-load.sql
 ```
 
-결과 확인 방법과 PASS 기준은 아래 "확인"/"PASS 기준" 절을 참고하세요.
+실행 스크립트가 매번 자동으로 하는 일:
+
+- 대상 회차의 판매 기간을 다시 엽니다(`open-sales-window.sql`). 기본 시드는 판매 종료를 시드 시점 + 2시간으로
+  넣기 때문에, 시간이 지나면 대기열 진입이 전부 `Q-006`으로 거절됩니다.
+- 시드된 좌석 수를 DB에서 읽어, 조회 1회마다 받은 좌석 수가 그 값과 같은지 검증합니다.
+- 목록·COUNT 쿼리의 `EXPLAIN (ANALYZE, BUFFERS)` 결과를 저장합니다.
 
 ## 구성 파일
 
 | 파일 | 역할 |
 |---|---|
-| `seat-list-load.js` | 단계별(50→100→300→500→1,000 VU) 좌석 목록 반복조회 k6 스크립트. `setup()`에서 큐 어드미션 토큰까지 자체 발급함 |
-| `run-seat-list-load-steps.sh` | 5단계(50/100/300/500/1000 VU)를 순서대로 실행하는 wrapper 스크립트 |
-| `seed-seat-list-load.sql` | 부하테스트용 더미 좌석 데이터 생성 (session_id/seat_count/available_ratio/held_ratio 파라미터화) |
-| `cleanup-seat-list-load.sql` | `seed-seat-list-load.sql`로 만든 더미 좌석만 골라 삭제 |
-| `seat-list.js` | 단일 VU·단일 요청으로 좌석 목록 API를 빠르게 수동 확인하는 스모크 스크립트 |
+| `run-seat-list-load-steps.sh` | 사전 준비 → 워밍업 → 단계별 k6 실행 → 서버 지표 수집 → 요약 표 출력 |
+| `seat-list-load.js` | k6 스크립트. `view` 시나리오가 표준이고, `setup()`에서 큐 토큰을 자체 발급합니다 |
+| `collect-server-metrics.sh` | 지정한 시간 구간의 서버 지표를 Prometheus에서 뽑아 JSON으로 저장 |
+| `explain-seat-list.sql` | 좌석 목록·COUNT 쿼리 실행 계획 확인 |
+| `open-sales-window.sql` | 대상 회차의 판매 기간을 "지금 판매 중"으로 갱신 |
+| `seed-seat-list-load.sql` / `cleanup-seat-list-load.sql` | 더미 좌석 생성 / 삭제 (`created_by=900099`로 구분) |
+| `seat-list.js` | 단일 요청으로 API를 빠르게 확인하는 스모크 스크립트 |
 
-## 준비
+`seat-list-load.js`의 `load`(VU 고정)·`compare` 시나리오는 이전 결과를 재현할 때만 씁니다.
 
-1. `docker-compose up -d`로 최소한 platform/ticketing 스택(각 DB·Redis 포함) + Prometheus/Grafana를 띄워둡니다. Gateway는 거치지 않고 ticketing-service(기본 `localhost:8082`)에 직접 요청합니다.
-2. 인기 회차(`event_session_id=31000000-0000-0000-0000-000000000001`)에 대량 더미 좌석을 생성합니다:
-   ```bash
-   psql "host=localhost port=5434 dbname=tikitaka_ticketing user=ticketing" \
-     -v session_id="'31000000-0000-0000-0000-000000000001'" \
-     -v seat_count=3000 \
-     -v available_ratio=0.05 \
-     -v held_ratio=0.05 \
-     -f scripts/test-scenarios/s11-seat-list-load/seed-seat-list-load.sql
-   ```
-3. k6 설치: `brew install k6` (또는 `docker run --rm -i grafana/k6 run - <script.js`). 큐 토큰 발급은 스크립트가 알아서 하므로 python/pip/venv는 불필요합니다.
+## 실행 옵션
 
-## 실행
+| 환경변수 | 기본값 | 의미 |
+|---|---|---|
+| `STAGES` | `10 20 30 50 100` | 단계별 초당 조회 시작 수 |
+| `VIEW_DURATION` | `2m` | 단계별 유지 시간 |
+| `VIEW_PAGE_SIZE` | `200` | 조회 1회에서 쓰는 페이지 크기 (API 최대값) |
+| `VIEW_MAX_VUS` | `300` | 동시에 진행 중일 수 있는 조회 수 상한. 다 차면 새 조회는 시작하지 못하고 `dropped_iterations`로 집계 |
+| `RECOVERY_WAIT` | `30` | 단계 사이 정상화 대기(초) |
+| `LABEL` | (없음) | 결과 폴더 이름 뒤에 붙는 표시 (예: `cache-off`) |
+
+⚠️ 한 단계(토큰 발급 + `VIEW_DURATION`)가 `queue.admission-token-ttl`(기본 3분)보다 길면 후반 요청이
+`Q-001`로 실패합니다. 유지 시간을 2분보다 늘릴 때는 아래처럼 TTL을 늘려서 띄우세요.
+
+## 조건을 바꿔가며 비교하기
+
+서버 조건은 재빌드 없이 환경변수로 바꿉니다(`docker-compose.test.yml`). **한 번에 하나만** 바꾸고 같은
+단계로 다시 실행한 뒤 두 결과 폴더의 `summary.md`를 비교하세요.
+
+| 환경변수 | 기본값 | 의미 |
+|---|---|---|
+| `SEAT_LIST_CACHE_ENABLED` | `true` | 좌석 목록 Caffeine 캐시 on/off |
+| `SEAT_LIST_CACHE_TTL_SECONDS` | `2` | 캐시 TTL(초) |
+| `TICKETING_DB_POOL_SIZE` | `10` | HikariCP 최대 커넥션 수 |
+| `QUEUE_ADMISSION_TOKEN_TTL` | `PT3M` | 큐 입장 토큰 TTL |
 
 ```bash
-BASE_URL=http://localhost:8082 scripts/test-scenarios/s11-seat-list-load/run-seat-list-load-steps.sh
+# 예: 캐시를 끈 상태로 재측정
+SEAT_LIST_CACHE_ENABLED=false docker compose -f docker-compose.yml -f docker-compose.test.yml up -d ticketing-service
+LABEL=cache-off scripts/test-scenarios/s11-seat-list-load/run-seat-list-load-steps.sh
 ```
 
-- 내부적으로 20 VU 워밍업 → 50 → 100 → 300 → 500 → 1,000 VU를 순서대로 실행합니다 (기본 ramp 20s / 유지 1m / ramp-down 20s, 총 1분40초/단계).
-- ⚠️ **admission-token-ttl(기본 3분=180s)보다 한 단계(mint + ramp + 유지 + ramp-down)가 길면 막판 요청이 토큰 만료(Q-001)로 대량 실패합니다.** 실측으로 확인된 문제로, 기본값(1분40초)은 이 TTL보다 충분히 짧게 잡아뒀습니다. 임의로 `LOAD_RAMP`/`LOAD_DURATION`을 늘릴 경우 이 여유를 꼭 다시 계산하세요.
-- 한 단계에서 threshold(p95<500ms, 오류율<1%)를 넘어도 스크립트는 죽지 않고 다음 단계로 계속 진행합니다 (`run-seat-list-load-steps.sh`가 k6의 비정상 종료 코드를 무시하도록 되어 있음).
-- 결과 JSON은 이 폴더가 아니라 `artifacts/k6/s11-seat-list-load/results/<타임스탬프>/`에 쌓입니다. 원본 콘솔 로그를 남기고 싶으면 `... run-seat-list-load-steps.sh 2>&1 | tee artifacts/k6/s11-seat-list-load/logs/run_$(date +%H%M%S).log`처럼 직접 리다이렉트하세요.
-- 단일 요청만 빠르게 확인하고 싶다면: `k6 run --env SESSION_ID=<id> --env QUEUE_TOKEN=<token> scripts/test-scenarios/s11-seat-list-load/seat-list.js`
+서버 코드를 바꿨다면 `--build`를 붙여 이미지를 다시 만들어야 반영됩니다. 실제로 어떤 이미지·설정으로
+측정됐는지는 결과 폴더의 `run-meta.txt`로 확인하세요.
 
-## 확인 (API, DB, Grafana)
+## 결과 확인
 
-- **응답시간/오류율/응답 크기**: k6 종료 시 출력되는 요약(`http_req_duration` p95/p99, `http_req_failed`, 커스텀 지표 `seat_response_size`)을 그대로 읽으면 됩니다. `seat_response_size`가 갑자기 커져 있다면(수백 KB) 페이지네이션이 적용되지 않은 응답을 받고 있다는 신호이니, ticketing-service가 최신 코드로 재빌드·재기동됐는지부터 확인하세요 (Dockerfile이 빌드 시점의 `src`를 이미지에 굽기 때문에, 소스만 고치고 컨테이너를 재빌드하지 않으면 예전 동작이 그대로 남습니다).
-- **DB 커넥션 풀**: Grafana에서 `hikaricp_connections_active`, `hikaricp_connections_pending`, `hikaricp_connections_timeout_total{job="ticketing-service"}` 확인.
-- **CPU/JVM Heap**: Grafana `TIKITAKA Load Test - Service` 대시보드에서 테스트 시간대로 범위를 맞춰 확인.
-- **부하 종료 후 정상화**: wrapper 스크립트가 각 단계 종료 후 `pg_stat_activity` 활성 커넥션 수를 출력합니다 — 평시 수준으로 내려오는지 확인.
+결과는 `artifacts/k6/s11-seat-list-load/<타임스탬프>[_LABEL]/`에 쌓입니다(Git에 올리지 않는 원본 자료).
 
-## PASS 기준
+| 파일 | 내용 |
+|---|---|
+| `summary.md` | 단계별 요약 표 (조회 p50/p95/p99, 실패율, 못 시작한 조회, 서버 지표 핵심값) |
+| `<rate>rps.k6.json` | k6 요약 원본 |
+| `<rate>rps.server.json` | 같은 구간의 서버 지표 |
+| `run-meta.txt` | 커밋, 이미지, 설정값, 좌석 수, 단계 구성 |
+| `explain.txt` | 목록·COUNT 쿼리 실행 계획 |
+| `recovery.txt` | 단계 종료 후 활성 DB 커넥션 수 |
 
-- 모든 단계에서 `http_req_duration p(95) < 500ms` 이고 `http_req_failed rate < 1%`.
-- `seat_response_size`가 요청한 `size`(기본 50)에 해당하는 수준(수 KB)으로 유지된다 — 수백 KB로 커지면 페이지네이션 미적용을 의심하고 FAIL로 취급.
-- Q-001(대기열 입장 권한 없음) 예외가 대량 발생하지 않는다 — 발생한다면 서버 성능 문제가 아니라 admission-token-ttl 대비 테스트 단계 길이 설정 문제일 가능성이 높음 (`docs/test-results/S11-seat-list-load/local-result.md` 참고).
+`<rate>rps.server.json`의 값으로 병목 구간을 구분합니다.
 
-## 정리
+| 값 | 의심할 수 있는 원인 |
+|---|---|
+| `tomcat.busy_threads_max`가 `max_threads`에 근접 | 요청 처리 스레드 부족 (뒤 구간이 느려 스레드가 묶임) |
+| `hikari.pending_max` > 0, `acquire_*_ms` 증가 | DB 커넥션 풀 대기 |
+| `seat_query.avg_ms`·`p95_ms` 증가 | 쿼리 자체가 느림 (`explain.txt`와 함께 확인) |
+| `cache.seat_list_hit_ratio`가 낮음 | 캐시가 부하를 흡수하지 못함 |
+| `redis.hgetall_*_ms` 증가 | 대기열 입장 검증(요청마다 Redis 조회) 구간 지연 |
+| `jvm.process_cpu_max`가 1에 근접, `gc_pause_*` 증가 | CPU 포화 / GC 정지 |
 
-- `seed-seat-list-load.sql`로 만든 더미 좌석은 아래로 정리합니다:
-  ```bash
-  psql "host=localhost port=5434 dbname=tikitaka_ticketing user=ticketing" \
-    -v session_id="'31000000-0000-0000-0000-000000000001'" \
-    -f scripts/test-scenarios/s11-seat-list-load/cleanup-seat-list-load.sql
-  ```
-- `artifacts/k6/s11-seat-list-load/` 아래 결과 JSON·로그·토큰 파일은 Git에 올리지 않는 원본 자료입니다 (용량이 크면 주기적으로 정리해도 됩니다). 결과를 팀에 공유할 때는 요약을 `docs/test-results/S11-seat-list-load/local-result.md`에 반영하세요.
+실시간 추이는 Grafana(`http://localhost:3000`) → Tikitaka 폴더 → **TIKITAKA Load Test - Seat List (S11)**
+대시보드에서 봅니다.
 
-## 성능 개선 실험: 필드 프로젝션 / 짧은 TTL 캐시
+## 한계
 
-페이지네이션 적용 이후 추가로 검증해볼 두 가지 개선안을, 서버 코드에 토글로 구현해뒀습니다.
-application.yaml 설정이 아니라 **코드 안의 상수**로 켜고 끕니다. 코드 최초 작성 시 기본값은 둘 다
-꺼져 있었지만(`false`), **지금 저장소 상태는 위 "지금 상태 그대로 재현하기" 절에 적힌 대로 둘 다
-`true`로 켜져 있습니다** — 아래 표의 "기본값"은 이 실험 자체를 처음 설계했을 때 기준이고, 실제로
-지금 코드에 어떤 값이 들어있는지는 항상 파일을 직접 열어 확인하세요.
-
-| 상수 | 위치 | 기본값 | 의미 |
-|---|---|---|---|
-| `PROJECTION_ENABLED` | `SeatListReader` | `false` | `true`면 `ScheduleSeat` 엔티티 전체(감사 컬럼 포함 15개) 대신, 응답에 실제 필요한 7개 컬럼만 JPQL 생성자 표현식으로 SELECT합니다. |
-| `CACHE_ENABLED` | `SeatListCacheConfig` | `false` | `true`면 동일한 `(eventSessionId, section, grade, page, size)` 조합 조회 결과를 `CACHE_TTL_SECONDS` 동안 캐싱합니다(Caffeine, in-memory). |
-| `CACHE_TTL_SECONDS` | `SeatListCacheConfig` | `2` | 캐시를 켰을 때의 TTL(초). |
-
-두 클래스 모두 `ticketing-service/src/main/java/com/tikitaka/ticketing/seat/` 아래에 있습니다
-(`application/service/SeatListReader.java`, `config/SeatListCacheConfig.java`).
-
-### 실행 방법 (한 번에 하나씩만 바꿔서 비교)
-
-기존 방식과 동일하게, 상수 하나만 바꾸고 재빌드·재기동한 뒤 **같은 VU 단계**로 다시 돌려서
-바로 직전 결과와 비교하세요.
-
-1. **베이스라인(현재 상태, 둘 다 off)**으로 먼저 한 번 실행해 기준값을 기록합니다.
-   ```bash
-   BASE_URL=http://localhost:8082 scripts/test-scenarios/s11-seat-list-load/run-seat-list-load-steps.sh
-   ```
-2. 실험하고 싶은 상수 **하나만** 바꿉니다. 예: `SeatListReader.java`
-   ```java
-   private static final boolean PROJECTION_ENABLED = true;   // 필드 프로젝션만 먼저 켜본다
-   ```
-3. 이미지를 재빌드하고 컨테이너를 재기동합니다 (Dockerfile이 빌드 시점 `src`를 굽기 때문에, 코드만
-   고치고 재빌드하지 않으면 이전 동작이 그대로 남습니다 — 위 "확인" 절에서와 동일한 주의사항).
-   ```bash
-   docker-compose up -d --build ticketing-service
-   # healthcheck가 healthy로 바뀔 때까지 대기 (최대 약 40s+10s*n)
-   docker-compose ps ticketing-service
-   ```
-4. 같은 단계로 다시 실행하고 결과를 비교합니다.
-   ```bash
-   BASE_URL=http://localhost:8082 scripts/test-scenarios/s11-seat-list-load/run-seat-list-load-steps.sh
-   ```
-5. 비교가 끝나면 `PROJECTION_ENABLED`는 그대로 두고 `SeatListCacheConfig.CACHE_ENABLED = true`만
-   추가로 켜서 2~4를 반복하면, "프로젝션만", "캐시만", "둘 다"의 3가지 조합을 순서대로 비교할 수
-   있습니다.
-
-### 확인 포인트
-
-- **응답시간(p95/p99)**: `http_req_duration`이 베이스라인 대비 얼마나 줄었는지.
-- **DB 부하**: Grafana `hikaricp_connections_active` / `hikaricp_connections_pending`이 프로젝션 on일 때
-  줄어드는지(하이드레이션할 컬럼이 적어 쿼리·GC 비용이 낮아지는 효과를 기대).
-- **캐시 적중 여부**: 캐시를 켰을 때 반복 조회 구간에서 `http_req_duration`이 눈에 띄게 더 낮아지는지 —
-  TTL(기본 2초)이 짧기 때문에, 동일 페이지를 짧은 간격으로 반복 조회하는 VU 비율이 낮으면 효과가
-  미미하게 나올 수 있습니다(이 경우 TTL을 일시적으로 늘려서 캐시 자체의 효과만 분리 검증해볼 수 있음).
-- **정합성**: 좌석 상태가 실시간으로 바뀌는 환경(선점/해제)에서는 캐시가 짧은 시간 동안 stale한
-  좌석 상태를 보여줄 수 있다는 트레이드오프가 있습니다 — TTL을 얼마나 짧게 가져갈지는 이 트레이드오프와
-  성능 개선 폭을 같이 보고 판단하세요.
-
-결과는 `docs/test-results/S11-seat-list-load/local-result.md`에 실험 조합별로 기록하세요.
-
+- k6와 서버가 같은 장비에서 돌아 CPU를 나눠 씁니다. 고부하 단계의 수치는 부하 생성기 영향이 섞여 있을 수
+  있으므로, 절대값보다 **같은 장비·같은 조건에서의 전후 비교**로 사용하세요.
+- 조회 1회 안의 페이지 요청은 순차로 보냅니다(브라우저의 병렬 요청은 모사하지 않음).
+- 서버 지표 구간은 k6 종료 시각에서 `VIEW_DURATION`만큼 거슬러 잡습니다. 종료 직후 몇 초가 포함될 수 있어
+  비율·분위수 값이 약간 낮게 나올 수 있습니다(최대값 계열은 영향 없음).

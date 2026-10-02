@@ -22,6 +22,8 @@ scrape_configs:
 
   # Ticketing Service 메트릭
   - job_name: ticketing-service
+    # 부하 테스트 한 단계가 1~2분이라 기본 15s로는 단계당 표본이 너무 적어 5s로 수집
+    scrape_interval: 5s
     metrics_path: /actuator/prometheus
     static_configs:
       - targets:

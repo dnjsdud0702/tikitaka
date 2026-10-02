@@ -28,10 +28,11 @@ services:
   ticketing-service:
     environment:
       SERVER_TOMCAT_MBEANREGISTRY_ENABLED: "true"
+      # 좌석 목록 조회(S11) 구간별 병목 확인용으로 Repository·Redis 명령 Histogram도 함께 켠다
       # HTTP Histogram은 항상 활성화하고, S05 환경변수가 있을 때만 Payment 주소·Feign Timeout이 테스트 값으로 바뀐
       # JSON으로 paymentCreationClient Map key를 보존함
       SPRING_APPLICATION_JSON: >-
-        {"management":{"metrics":{"distribution":{"percentiles-histogram":{"http.server.requests":true}}}},"clients":{"payment-notification-service":{"url":"${S05_PAYMENT_SERVICE_URL:-http://payment-notification-service:8083}"}},"spring":{"cloud":{"openfeign":{"client":{"config":{"paymentCreationClient":{"connectTimeout":${S05_PAYMENT_CONNECT_TIMEOUT:-1000},"readTimeout":${S05_PAYMENT_READ_TIMEOUT:-60000}}}}}}}}
+        {"management":{"metrics":{"distribution":{"percentiles-histogram":{"http.server.requests":true,"spring.data.repository.invocations":true,"lettuce.command.completion":true}}}},"clients":{"payment-notification-service":{"url":"${S05_PAYMENT_SERVICE_URL:-http://payment-notification-service:8083}"}},"spring":{"cloud":{"openfeign":{"client":{"config":{"paymentCreationClient":{"connectTimeout":${S05_PAYMENT_CONNECT_TIMEOUT:-1000},"readTimeout":${S05_PAYMENT_READ_TIMEOUT:-60000}}}}}}}}
 
       # Ticketing Service의 Kafka Consumer 실행 여부
       # 기본값: true (Consumer 정상 실행)
@@ -46,6 +47,12 @@ services:
       # 환경변수를 안 주면 application.yaml의 기본값(enabled=true, ttl-seconds=2)이 그대로 적용됩니다.
       SEAT_LIST_CACHE_ENABLED: ${SEAT_LIST_CACHE_ENABLED:-true}
       SEAT_LIST_CACHE_TTL_SECONDS: ${SEAT_LIST_CACHE_TTL_SECONDS:-2}
+
+      # S11 부하 테스트 조건을 재빌드 없이 고정·변경하기 위한 오버라이드 설정
+      # - 토큰 TTL: 부하 단계 길이가 TTL(기본 3분)에 묶이지 않도록 테스트 때만 늘린다 (예: PT30M)
+      # - 커넥션 풀: 기본값은 HikariCP 기본값(10)과 동일하며, 풀 크기 가설 검증 시에만 바꾼다
+      QUEUE_ADMISSION_TOKEN_TTL: ${QUEUE_ADMISSION_TOKEN_TTL:-PT3M}
+      SPRING_DATASOURCE_HIKARI_MAXIMUM_POOL_SIZE: ${TICKETING_DB_POOL_SIZE:-10}
 
   payment-notification-service:
     environment:
